@@ -46,33 +46,103 @@ const id = (req: Request) => {
 
 const REQUEST_ID_RE = /^[A-Za-z0-9._-]{8,128}$/;
 
+/** Admin read authorization middleware. Returns 404 if ADMIN_READ_TOKEN is not configured, 401 if invalid/missing. */
+function requireAdminRead(req: Request, res: Response, next: NextFunction) {
+  const expected = process.env.ADMIN_READ_TOKEN;
+  if (!expected) {
+    res.status(404).json({ error: 'admin_not_configured', message: 'Admin endpoints are not configured' });
+    return;
+  }
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'unauthorized', message: 'Missing or invalid admin bearer token' });
+    return;
+  }
+  const token = auth.slice('Bearer '.length);
+  // Use timing-safe comparison to prevent timing attacks
+  const expectedBuf = Buffer.from(expected);
+  const tokenBuf = Buffer.from(token);
+  if (expectedBuf.length !== tokenBuf.length || !timingSafeEqual(expectedBuf, tokenBuf)) {
+    res.status(401).json({ error: 'unauthorized', message: 'Missing or invalid admin bearer token' });
+    return;
+  }
+  next();
+}
+
+/** Validate and normalize dispute status filter. */
+function disputeStatus(value: unknown): DisputeStatusFilter {
+  if (value === undefined) return 'all';
+  if (typeof value !== 'string') throw new HttpError(400, 'invalid_status', 'status must be a single string value');
+  if (value !== 'open' && value !== 'resolved' && value !== 'all') {
+    throw new HttpError(400, 'invalid_status', "status must be one of 'open', 'resolved', 'all'");
+  }
+  return value;
+}
+
+/** Validate and normalize dispute sort order. */
+function disputeSort(value: unknown): DisputeSort {
+  if (value === undefined) return 'oldest';
+  if (typeof value !== 'string') throw new HttpError(400, 'invalid_sort', 'sort must be a single string value');
+  if (value !== 'oldest' && value !== 'newest' && value !== 'value') {
+    throw new HttpError(400, 'invalid_sort', "sort must be one of 'oldest', 'newest', 'value'");
+  }
+  return value;
+}
+
+/** Validate and normalize overdue filter. */
+function disputeOverdue(value: unknown): boolean {
+  if (value === undefined) return false;
+  if (typeof value !== 'string') throw new HttpError(400, 'invalid_overdue', 'overdue must be a single string value');
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  throw new HttpError(400, 'invalid_overdue', "overdue must be 'true' or 'false'");
+}
+
+/** Validate and normalize limit parameter. */
+function disputeLimit(value: unknown): number {
+  if (value === undefined) return DEFAULT_DISPUTE_LIMIT;
+  if (typeof value !== 'string') throw new HttpError(400, 'invalid_limit', 'limit must be a single string value');
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1 || n > MAX_DISPUTE_LIMIT) {
+    throw new HttpError(400, 'invalid_limit', `limit must be an integer between 1 and ${MAX_DISPUTE_LIMIT}`);
+  }
+  return n;
+}
+
+/** Current time provider for dispute handlers. Can be overridden in tests via createApp options. */
+function now(): Date {
+  return new Date();
+}
+
 function resolveStoreAndLogger(
-  storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } = new EscrowStore().seed(),
-): { store: EscrowStore; logger: Logger; chainReader: ChainReader } {
+  storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader; now?: () => Date } = new EscrowStore().seed(),
+): { store: EscrowStore; logger: Logger; chainReader: ChainReader; now: () => Date } {
   if (
     storeOrOpts &&
     typeof storeOrOpts === 'object' &&
     'list' in storeOrOpts &&
     typeof (storeOrOpts as EscrowStore).list === 'function'
   ) {
-    return { store: storeOrOpts as EscrowStore, logger: createLogger(), chainReader: new SorobanRpcChainReader() };
+    return { store: storeOrOpts as EscrowStore, logger: createLogger(), chainReader: new SorobanRpcChainReader(), now: () => new Date() };
   }
-  const opts = (storeOrOpts as { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } | undefined) ?? {};
+  const opts = (storeOrOpts as { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader; now?: () => Date } | undefined) ?? {};
   return {
     store: opts.store ?? new EscrowStore().seed(),
     logger: opts.logger ?? createLogger(),
     chainReader: opts.chainReader ?? new SorobanRpcChainReader(),
+    now: opts.now ?? (() => new Date()),
   };
 }
 
 export function createApp(
-  storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } = new EscrowStore().seed(),
+  storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader; now?: () => Date } = new EscrowStore().seed(),
   fallbackChainReader?: ChainReader,
 ) {
   const resolved = resolveStoreAndLogger(storeOrOpts);
   const store = resolved.store;
   const logger = resolved.logger;
   const chainReader = fallbackChainReader ?? resolved.chainReader;
+  const nowFn = resolved.now;
 
   const app = express();
   app.disable('x-powered-by');
@@ -187,7 +257,7 @@ export function createApp(
           status: typeof req.query.status === 'string' ? req.query.status : undefined,
           party: typeof req.query.party === 'string' ? req.query.party : undefined,
           linked,
-        }),
+        }).map(publicContract),
       };
     }),
   );
@@ -236,7 +306,7 @@ export function createApp(
         overdueOnly: disputeOverdue(req.query.overdue),
         limit: disputeLimit(req.query.limit),
         cursor,
-        now: now(),
+        now: nowFn(),
         slaHours: config.disputeSlaHours,
       });
     }),
@@ -249,7 +319,7 @@ export function createApp(
       if (!Number.isInteger(n) || n < 1) {
         throw new HttpError(400, 'invalid_id', 'contractId must be a positive integer');
       }
-      return store.getDispute(n, now(), config.disputeSlaHours);
+      return store.getDispute(n, nowFn(), config.disputeSlaHours);
     }),
   );
   app.use('/api/v1', v1);

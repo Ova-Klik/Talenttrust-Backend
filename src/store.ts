@@ -154,6 +154,16 @@ export class EscrowStore {
   private contracts = new Map<number, EscrowContract>();
   private reputation = new Map<string, { completed: number; total: number }>();
   private nextId = 1;
+  private readonly clock: () => Date;
+
+  constructor(clock?: () => Date) {
+    this.clock = clock ?? (() => new Date());
+  }
+
+  /** Current time according to the injected clock (or system clock). */
+  now(): Date {
+    return this.clock();
+  }
 
   list(filter: { status?: string; party?: string; linked?: boolean } = {}): EscrowContract[] {
     return [...this.contracts.values()].filter(
@@ -341,13 +351,12 @@ export class EscrowStore {
     if (!Number.isInteger(bps) || bps < 0 || bps > 10000) {
       throw new HttpError(400, 'invalid_split', 'freelancerBps must be an integer between 0 and 10000');
     }
-    const remaining = Number(c.fundedAmount) - Number(c.releasedAmount);
-    const toFreelancer = Math.round((remaining * bps) / 10000);
-    c.releasedAmount = Number(c.releasedAmount) + toFreelancer;
+    // Full remaining amount is released upon resolution (split between parties per bps)
+    c.releasedAmount = c.fundedAmount;
     c.status = 'Resolved';
     if (c.dispute) {
       c.dispute.freelancerBps = bps;
-      c.dispute.resolvedAt = new Date().toISOString();
+      c.dispute.resolvedAt = this.now().toISOString();
     }
     return this.touch(c);
   }
@@ -611,6 +620,7 @@ export class EscrowStore {
     if (!dispute) throw new HttpError(404, 'dispute_not_found', `No dispute for contract ${c.id}`);
     const openedMs = Date.parse(dispute.openedAt);
     const ageHours = Math.max(0, Math.round(((now.getTime() - openedMs) / 3_600_000) * 100) / 100);
+    const held = this.toNumber(c.fundedAmount) - this.toNumber(c.releasedAmount);
     const view: DisputeView = {
       contractId: c.id,
       title: c.title,
@@ -621,13 +631,18 @@ export class EscrowStore {
       reason: dispute.reason,
       openedAt: dispute.openedAt,
       ageHours,
-      held: c.fundedAmount - c.releasedAmount,
+      held,
       slaDeadline: new Date(openedMs + slaHours * 3_600_000).toISOString(),
       overdue: c.status === 'Disputed' && now.getTime() > openedMs + slaHours * 3_600_000,
     };
     if (dispute.resolvedAt !== undefined) view.resolvedAt = dispute.resolvedAt;
     if (dispute.freelancerBps !== undefined) view.freelancerBps = dispute.freelancerBps;
     return view;
+  }
+
+  /** Convert a stored amount (number or bigint string) to a JavaScript number. */
+  private toNumber(amount: number | string): number {
+    return typeof amount === 'string' ? Number(amount) : amount;
   }
 
   private compareDisputes(sort: DisputeSort, a: DisputeRecord, b: DisputeRecord): number {

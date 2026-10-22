@@ -45,7 +45,7 @@ describe('Admin dispute queue', () => {
   beforeEach(() => {
     currentMs = T0;
     store = new EscrowStore(clock);
-    app = createApp(store, { now: clock });
+    app = createApp({ store, now: clock });
     process.env.ADMIN_READ_TOKEN = TOKEN;
   });
 
